@@ -6,6 +6,7 @@ package badgerhold
 
 import (
 	"bytes"
+	"encoding/binary"
 	"reflect"
 	"sort"
 
@@ -55,52 +56,45 @@ func (s *Store) indexDelete(storer Storer, tx *badger.Txn, key []byte, originalD
 func (s *Store) indexUpdate(typeName, indexName string, index Index, tx *badger.Txn, key []byte, value interface{},
 	delete bool) error {
 
-	indexKey, err := index.IndexFunc(indexName, value)
-	if indexKey == nil {
+	encValue, err := index.IndexFunc(indexName, value)
+	if encValue == nil {
 		return nil
 	}
 
-	indexValue := make(keyList, 0)
-
 	if err != nil {
 		return err
 	}
 
-	indexKey = append(indexKeyPrefix(typeName, indexName), indexKey...)
+	// TODO: optimize
+	indexKey := indexKeyPrefix(typeName, indexName)
+	indexKey = append(indexKey, ':')
 
-	item, err := tx.Get(indexKey)
-	if err != nil && err != badger.ErrKeyNotFound {
-		return err
-	}
+	varintBuf := make([]byte, binary.MaxVarintLen64)
+	varintLen := binary.PutUvarint(varintBuf, uint64(len(encValue)))
+	indexKey = append(indexKey, varintBuf[:varintLen]...)
 
-	if err != badger.ErrKeyNotFound {
-		if index.Unique && !delete {
+	indexKey = append(indexKey, encValue...)
+	indexKey = append(indexKey, ':')
+
+	// Before we add the unique key, if this is a unique index and we're
+	// inserting, error out if the index value isn't actually unique.
+	// TODO: use a different indexing mechanism for unique indexes?
+	if index.Unique && !delete {
+		iter := tx.NewIterator(badger.DefaultIteratorOptions)
+		iter.Seek(indexKey)
+		if iter.ValidForPrefix(indexKey) {
+			iter.Close()
 			return ErrUniqueExists
 		}
-		err = item.Value(func(iVal []byte) error {
-			return s.decode(iVal, &indexValue)
-		})
-		if err != nil {
-			return err
-		}
+		iter.Close()
 	}
+
+	indexKey = append(indexKey, key...)
 
 	if delete {
-		indexValue.remove(key)
-	} else {
-		indexValue.add(key)
-	}
-
-	if len(indexValue) == 0 {
 		return tx.Delete(indexKey)
 	}
-
-	iVal, err := s.encode(indexValue)
-	if err != nil {
-		return err
-	}
-
-	return tx.Set(indexKey, iVal)
+	return tx.Set(indexKey, nil)
 }
 
 // indexKeyPrefix returns the prefix of the badger key where this index is stored
@@ -268,29 +262,27 @@ func (s *Store) newIterator(tx *badger.Txn, typeName string, query *Query, bookm
 			}
 
 			item := iter.Item()
-			key := item.KeyCopy(nil)
+			itemKey := item.KeyCopy(nil)
+
 			// no currentRow on indexes as it refers to multiple rows
 			// remove index prefix for matching
-			ok, err := s.matchesAllCriteria(criteria, key[len(prefix):], true, "", nil)
+			valueAndKey := itemKey[len(prefix)+1:]
+
+			splitIdx, splitIdxLen := binary.Uvarint(valueAndKey)
+			valueAndKey = valueAndKey[splitIdxLen:]
+
+			value := valueAndKey[:splitIdx]
+			ok, err := s.matchesAllCriteria(criteria, value, true, "", nil)
 			if err != nil {
 				return nil, err
 			}
 
 			if ok {
-				item.Value(func(v []byte) error {
-					// append the slice of keys stored in the index
-					var keys = make(keyList, 0)
-					err := s.decode(v, &keys)
-					if err != nil {
-						return err
-					}
-
-					nKeys = append(nKeys, [][]byte(keys)...)
-					return nil
-				})
+				key := valueAndKey[splitIdx+1:]
+				nKeys = append(nKeys, key)
 			}
 
-			i.lastSeek = key
+			i.lastSeek = itemKey
 			iter.Next()
 
 		}
