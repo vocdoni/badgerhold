@@ -6,11 +6,14 @@ package badgerhold_test
 
 import (
 	"fmt"
+	"io"
+	mathrand "math/rand"
 	"regexp"
 	"strings"
 	"testing"
 	"time"
 
+	qt "github.com/frankban/quicktest"
 	"github.com/timshannon/badgerhold/v3"
 )
 
@@ -1174,4 +1177,76 @@ func TestCount(t *testing.T) {
 			})
 		}
 	})
+}
+
+type Vote struct {
+	Nullifier     []byte `badgerhold:"index"`
+	Foo           string
+	Bar           int
+	NullifierCopy []byte
+}
+
+func TestFastFindOne(t *testing.T) {
+	options := badgerhold.DefaultOptions
+	options.Dir = "data"
+	options.ValueDir = "data"
+	store, err := badgerhold.Open(options)
+	qt.Assert(t, err, qt.IsNil)
+	defer store.Close()
+
+	start := time.Now()
+	rnd := mathrand.New(mathrand.NewSource(start.UnixNano()))
+	selected := [][]byte{}
+	for i := 0; i < 20_000; i++ {
+		vote := &Vote{
+			Nullifier: make([]byte, 32),
+			Foo:       "some data",
+			Bar:       123,
+		}
+		_, err := io.ReadFull(rnd, vote.Nullifier)
+		qt.Assert(t, err, qt.IsNil)
+		vote.NullifierCopy = append([]byte{}, vote.Nullifier...)
+
+		if i%2000 == 0 {
+			selected = append(selected, vote.Nullifier)
+		}
+
+		err = store.Insert(vote.Nullifier, vote)
+		qt.Assert(t, err, qt.IsNil)
+	}
+	t.Logf("inserted in %v", time.Since(start))
+	start = time.Now()
+
+	for _, nullifier := range selected {
+		vote := &Vote{}
+		err := store.FindOne(vote, badgerhold.Where(badgerhold.Key).Eq(nullifier))
+		qt.Assert(t, err, qt.IsNil)
+		qt.Assert(t, vote.Nullifier, qt.DeepEquals, nullifier)
+		qt.Assert(t, vote.NullifierCopy, qt.DeepEquals, nullifier)
+	}
+
+	t.Logf("found in %v", time.Since(start))
+	start = time.Now()
+
+	for _, nullifier := range selected {
+		vote := &Vote{}
+		err := store.FindOne(vote, badgerhold.Where(badgerhold.Key).Eq(nullifier).Index("Nullifier"))
+		qt.Assert(t, err, qt.IsNil)
+		qt.Assert(t, vote.Nullifier, qt.DeepEquals, nullifier)
+		qt.Assert(t, vote.NullifierCopy, qt.DeepEquals, nullifier)
+	}
+
+	t.Logf("found with index in %v", time.Since(start))
+	start = time.Now()
+
+	for _, nullifier := range selected {
+		vote := &Vote{}
+		err := store.FindOne(vote, badgerhold.Where("Nullifier").Eq(nullifier))
+		qt.Assert(t, err, qt.IsNil)
+		qt.Assert(t, vote.Nullifier, qt.DeepEquals, nullifier)
+		qt.Assert(t, vote.NullifierCopy, qt.DeepEquals, nullifier)
+	}
+
+	t.Logf("found with key in %v", time.Since(start))
+	start = time.Now()
 }

@@ -202,9 +202,32 @@ func (s *Store) newIterator(tx *badger.Txn, typeName string, query *Query, bookm
 		criteria = nil
 	}
 
+	// If the query is like:
+	//
+	//    Where(badgerhold.Key).Eq(someValue)
+	//
+	// seek directly to where the key should be, to avoid a terrible linear search.
+	//
+	// TODO: if the key doesn't exist, we'll still loop over the remaining keys.
+	// TODO: do this for Where("KeyField").Eq(...) too
+	// TODO: error if an index is used as well, as it makes no sense?
+	// TODO: do this even if other field criteria are present, as the key must match
+	if query.index == "" && len(query.fieldCriteria) == 1 && len(criteria) == 1 {
+		crit := criteria[0]
+		if crit.operator == eq {
+			encKey, err := s.encodeKey(crit.value, typeName)
+			if err != nil {
+				panic(err)
+			}
+			prefix = encKey
+		}
+	}
+
 	// Key field or index not specified - test key against criteria (if it exists) or return everything
 	if query.index == "" || len(criteria) == 0 {
-		prefix = typePrefix(typeName)
+		if len(prefix) == 0 {
+			prefix = typePrefix(typeName)
+		}
 		i.iter.Seek(prefix)
 		i.nextKeys = func(iter *badger.Iterator) ([][]byte, error) {
 			var nKeys [][]byte
